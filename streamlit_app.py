@@ -2,6 +2,9 @@ import streamlit as st
 import zipfile
 import io
 import datetime
+import re
+import math
+from typing import Optional, Tuple
 
 # ========== G-code Processing Functions
 def get_sweep_pattern():
@@ -133,234 +136,298 @@ def find_gcode_sections(gcode_text):
         
     return header, print_moves, footer
 
-def create_looped_gcode(gcode_text, num_loops, sweep_interval_min):
-    """Create G-code with loops and sweeps."""
+def safe_decode(data: bytes) -> str:
+    """Try multiple decodings before failing."""
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    raise UnicodeDecodeError("all", b"", 0, 1, "Unable to decode G-code bytes")
+
+def extract_first_gcode_from_3mf(uploaded_file) -> Tuple[str, str]:
+    """
+    Returns (gcode_text, internal_path).
+    Raises GcodeParseError if not found / unreadable.
+    """
+    try:
+        with zipfile.ZipFile(uploaded_file, "r") as z:
+            gcode_paths = [p for p in z.namelist() if p.endswith(".gcode")]
+            if not gcode_paths:
+                raise GcodeParseError(f"No .gcode asset found in {uploaded_file.name}")
+            raw = z.read(gcode_paths[0])
+            text = safe_decode(raw)
+            return text, gcode_paths[0]
+    except zipfile.BadZipFile:
+        raise GcodeParseError(f"{uploaded_file.name} is not a valid 3MF (zip) file")
+    except UnicodeDecodeError as ue:
+        raise GcodeParseError(f"Encoding error in {uploaded_file.name}: {ue}")
+
+def enforce_limits(num_loops: int, files_count: int, custom_sweep: str):
+    if num_loops > MAX_LOOPS:
+        raise ValueError(f"Loops exceed limit ({num_loops}>{MAX_LOOPS})")
+    if files_count > MAX_FILES:
+        raise ValueError(f"Too many files ({files_count}>{MAX_FILES})")
+    if custom_sweep and (len(custom_sweep.encode('utf-8'))/1024) > MAX_CUSTOM_SWEEP_KB:
+        raise ValueError(f"Custom sweep too large (> {MAX_CUSTOM_SWEEP_KB} KB)")
+
+def approx_size_mb(s: str) -> float:
+    return len(s.encode('utf-8')) / (1024*1024)
+
+# --- Optimized: use list assembly instead of repeated += ---
+
+def create_looped_gcode(gcode_text, num_loops, sweep_interval_min,
+                        sweep_pattern_override=None, disable_final_home=False):
     sweep_interval_sec = sweep_interval_min * 60
-
-    # Define sweep pattern
-    sweep = """
-; --- AUTO SWEEP START ---
-M400
-G91
-G1 Z5 F2000
-G90
-G1 X0 Y220 F6000
-G1 X0 Y0 F6000
-G1 X55 Y220 F6000
-G1 X55 Y0 F6000
-G1 X110 Y220 F6000
-G1 X110 Y0 F6000
-G1 X165 Y220 F6000
-G1 X165 Y0 F6000
-G1 X220 Y220 F6000
-G1 X220 Y0 F6000
-M400
-; --- AUTO SWEEP END ---
-"""
-
-    # Extract G-code sections
+    sweep = (sweep_pattern_override.strip() + "\n") if sweep_pattern_override and sweep_pattern_override.strip() else get_sweep_pattern()
     header, print_moves, footer = find_gcode_sections(gcode_text)
-    
-    # Build the looped G-code
-    new_gcode = header
-    
+
+    parts = [header]
     for i in range(num_loops):
-        new_gcode += f"\n; === LOOP {i+1} START ===\n"
-        new_gcode += print_moves
-        new_gcode += f"\n; === LOOP {i+1} END ===\n"
-        
-        # Add sweep and wait between loops except last
+        parts.append(f"\n; === LOOP {i+1} START ===\n")
+        parts.append(print_moves)
+        parts.append(f"\n; === LOOP {i+1} END ===\n")
         if i < num_loops - 1:
-            new_gcode += f"""
-; --- WAITING AND SWEEPING ---
+            parts.append(
+f"""\n; --- WAITING AND SWEEPING ---
 M400
 G4 S{sweep_interval_sec} ; wait {sweep_interval_min} minutes
 {sweep}
-"""
-    
-    # Add final sweep and footer
-    new_gcode += f"""
-; --- FINAL SWEEP ---
-{sweep}
-G28 ; home all axes
-"""
-    new_gcode += footer
-    
-    return new_gcode
+""")
+    parts.append("\n; --- FINAL SWEEP ---\n")
+    parts.append(sweep)
+    if not disable_final_home:
+        parts.append("G28 ; home all axes\n")
+    parts.append(footer)
 
-def wrap_in_3mf(gcode_text, input_3mf):
-    """Create a new 3MF with looped G-code."""
-    output = io.BytesIO()
-    
-    with zipfile.ZipFile(input_3mf, 'r') as src_zip:
-        with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as dst_zip:
-            # Copy all files from original 3MF except G-code
-            for item in src_zip.filelist:
-                if not item.filename.endswith('.gcode'):
-                    dst_zip.writestr(item.filename, src_zip.read(item.filename))
-            
-            # Find original G-code path
-            gcode_files = [f for f in src_zip.namelist() if f.endswith('.gcode')]
-            if not gcode_files:
-                raise ValueError("No G-code found in 3MF file")
-            
-            # Add new G-code using same path as original
-            dst_zip.writestr(gcode_files[0], gcode_text)
-    
-    output.seek(0)
-    return output
+    out = "".join(parts)
+    if approx_size_mb(out) > MAX_OUTPUT_GCODE_MB:
+        raise GcodeSizeError(f"Output G-code exceeds {MAX_OUTPUT_GCODE_MB} MB limit (try fewer loops)")
+    return out
+
+def build_combined_looped_gcode(three_mf_files, num_loops, sweep_interval_min,
+                                sweep_between_files=True, per_file_wait_min=0,
+                                sweep_pattern_override=None, disable_final_home=False):
+    sweep_interval_sec = sweep_interval_min * 60
+    per_file_wait_sec = per_file_wait_min * 60
+    sweep = (sweep_pattern_override.strip() + "\n") if sweep_pattern_override and sweep_pattern_override.strip() else get_sweep_pattern()
+
+    # Header from first file
+    first_text, _ = extract_first_gcode_from_3mf(three_mf_files[0])
+    header, _, _ = find_gcode_sections(first_text)
+
+    base_parts = [header, "\n; === COMBINED FILES BASE SEQUENCE START ===\n"]
+    for idx, uf in enumerate(three_mf_files):
+        gtxt, _ = extract_first_gcode_from_3mf(uf)
+        _, print_moves, _ = find_gcode_sections(gtxt)
+        base_parts.append(f"\n; --- FILE {idx+1}: {uf.name} START ---\n")
+        base_parts.append(print_moves)
+        base_parts.append(f"\n; --- FILE {idx+1}: {uf.name} END ---\n")
+        if idx < len(three_mf_files) - 1 and sweep_between_files:
+            if per_file_wait_min > 0:
+                base_parts.append(f"\n; WAIT BEFORE NEXT FILE\nG4 S{per_file_wait_sec} ; wait {per_file_wait_min} minutes\n")
+            base_parts.append(f"\n; SWEEP BETWEEN FILES\n{sweep}")
+
+    base_parts.append("\n; === COMBINED FILES BASE SEQUENCE END ===\n")
+    combined_base = "".join(base_parts)
+
+    loop_parts = ["; === MULTI-FILE LOOPED FARM MODE START ===\n"]
+    for li in range(num_loops):
+        loop_parts.append(f"\n; ===== LOOP {li+1} START =====\n")
+        loop_parts.append(combined_base)
+        loop_parts.append(f"\n; ===== LOOP {li+1} END =====\n")
+        if li < num_loops - 1:
+            loop_parts.append(
+f"""\n; --- BETWEEN LOOP SEQUENCES ---
+G4 S{sweep_interval_sec} ; wait {sweep_interval_min} minutes
+{sweep}""")
+    loop_parts.append(f"\n; FINAL SWEEP{' (NO HOME)' if disable_final_home else ' & HOME'}\n")
+    loop_parts.append(sweep)
+    if not disable_final_home:
+        loop_parts.append("\nG28")
+    loop_parts.append("\n; === MULTI-FILE LOOPED FARM MODE END ===\n")
+
+    out = "".join(loop_parts)
+    if approx_size_mb(out) > MAX_OUTPUT_GCODE_MB:
+        raise GcodeSizeError(f"Output G-code exceeds {MAX_OUTPUT_GCODE_MB} MB limit (reduce loops/files)")
+    return out
+
+# ========== Runtime Estimation ==========
+def parse_estimated_minutes(gcode_text):
+    """Attempt to parse sliced time estimate (in minutes) from comments typical of Bambu / Cura style.
+    Returns float minutes or None if not found.
+    Searches for patterns like 'TIME:12345' (seconds) or ';TIME_ELAPSED:' and ';ESTIMATED_TIME:' etc.
+    """
+    # Common patterns
+    patterns = [
+        r";ESTIMATED_TIME:?\s*(\d+)",          # seconds
+        r";TIME:(\d+)",                          # seconds
+        r";PRINT_TIME:?\s*(\d+)",              # seconds
+        r"; total estimated time \(s\): (\d+)", # seconds
+        r"; layer_count: \d+.*?; total_time: (\d+)", # seconds maybe
+    ]
+    for pat in patterns:
+        m = re.search(pat, gcode_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            try:
+                seconds = int(m.group(1))
+                if seconds > 0:
+                    return seconds / 60.0
+            except ValueError:
+                continue
+    # Try Bambu style JSON-ish comment lines like '; PRINT_ESTIMATE_TIME: 01:23:45'
+    hm = re.search(r"PRINT_ESTIMATE_TIME:\s*(\d+):(\d+):(\d+)", gcode_text)
+    if hm:
+        h, m_, s_ = hm.groups()
+        return (int(h) * 3600 + int(m_) * 60 + int(s_)) / 60.0
+    return None
+
+def estimate_combined_runtime_per_loop(file_infos, sweep_between_files, per_file_wait_min, sweep_pattern, sweep_interval_min):
+    """Compute estimated minutes for one loop sequence (excluding between-loop wait)."""
+    base = 0.0
+    for info in file_infos:
+        if info.get('minutes'):
+            base += info['minutes']
+    # Add waits between files
+    if per_file_wait_min and len(file_infos) > 1:
+        base += per_file_wait_min * (len(file_infos) - 1)
+    # Approximate sweep time: rough guess from number of movement lines * small constant
+    sweep_time_guess_min = max(0.1, sweep_pattern.count('\nG1') * 0.5 / 60.0)  # naive heuristic
+    if sweep_between_files and len(file_infos) > 1:
+        base += sweep_time_guess_min * (len(file_infos) - 1)
+    return base, sweep_time_guess_min
 
 # ========== Streamlit UI ==========
-
-# Remove the first UI section since we're using the updated version below
-
-# Add new function to handle multiple files with loops
-def build_combined_looped_gcode(three_mf_files, num_loops, sweep_interval_min):
-    """Handle multiple 3MF files and create looped G-code with sweeps."""
-    sweep_interval_sec = sweep_interval_min * 60
-    sweep = get_sweep_pattern()
-
-    # Get header from first file to preserve machine settings
-    with zipfile.ZipFile(three_mf_files[0], "r") as zip_ref:
-        gcode_files = [f for f in zip_ref.namelist() if f.endswith(".gcode")]
-        if not gcode_files:
-            raise ValueError(f"No G-code found inside first file. Please ensure it's sliced in Bambu Studio.")
-        first_gcode = zip_ref.read(gcode_files[0]).decode("utf-8")
-        header, _, _ = find_gcode_sections(first_gcode)
-
-    # Combine all files into one sequence
-    combined_base = header + "\n; === COMBINED FILES BASE SEQUENCE ===\n"
-    
-    for idx, uploaded_file in enumerate(three_mf_files):
-        with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
-            gcode_files = [f for f in zip_ref.namelist() if f.endswith(".gcode")]
-            if not gcode_files:
-                raise ValueError(f"No G-code found inside {uploaded_file.name}. Slice it first in Bambu Studio.")
-            gcode_text = zip_ref.read(gcode_files[0]).decode("utf-8")
-            
-            # Extract just the print moves
-            _, print_moves, _ = find_gcode_sections(gcode_text)
-            
-            combined_base += f"\n; === FILE {idx+1}: {uploaded_file.name} START ===\n"
-            combined_base += print_moves
-            combined_base += f"\n; === FILE {idx+1}: {uploaded_file.name} END ===\n"
-            
-            # Add sweep between files except last
-            if idx < len(three_mf_files) - 1:
-                combined_base += f"\n; --- SWEEP BETWEEN FILES ---\n{sweep}\n"
-
-    # Now create the final looped version
-    final_gcode = "; === COMBINED AND LOOPED FARM MODE GCODE START ===\n"
-    
-    # Add the combined sequence multiple times based on num_loops
-    for i in range(num_loops):
-        final_gcode += f"\n; ====== LOOP {i+1} START ======\n"
-        final_gcode += combined_base
-        final_gcode += f"\n; ====== LOOP {i+1} END ======\n"
-        
-        # Add sweep between loops except last
-        if i < num_loops - 1:
-            final_gcode += f"""
-; --- SWEEP BETWEEN LOOPS ---
-M400
-G4 S{sweep_interval_sec} ; wait {sweep_interval_min} minutes
-{sweep}
-"""
-
-    # Final sweep + homing
-    final_gcode += f"""
-; --- FINAL SWEEP ---
-M400
-{sweep}
-G28 ; home all axes
-; === COMBINED AND LOOPED FARM MODE GCODE END ===
-"""
-    return final_gcode
-
-# Update the Streamlit UI section
 st.title("🖨️ Bambu Lab Print Looper")
 
 uploaded_files = st.file_uploader(
-    "📂 Upload one or more sliced .3mf files", 
-    type=["3mf"], 
+    "📂 Upload one or more sliced .3mf files",
+    type=["3mf"],
     accept_multiple_files=True,
     key="file_upload"
 )
 
-num_loops = st.number_input("🔁 Number of loops", min_value=1, value=1, key="num_loops")
-sweep_interval = st.number_input("⏱️ Minutes between loops", min_value=1, value=60, key="sweep_interval")
+num_loops = st.number_input("🔁 Number of loop sequences", min_value=1, value=1, key="num_loops")
+sweep_interval = st.number_input("⏱️ Minutes between loop sequences", min_value=0, value=60, key="sweep_interval")
+disable_final_home = st.checkbox("🚫 Skip final homing (G28)", value=False, help="Leave unchecked unless you have a reason to avoid homing after final sweep.")
+
+with st.expander("🧹 Sweep Pattern (optional override)"):
+    custom_sweep = st.text_area(
+        "Custom sweep G-code (leave blank to use default)",
+        value="",
+        placeholder="Paste or author a custom cleanup / purge / wipe pattern here..."
+    )
+
+sweep_between_files = False
+per_file_wait = 0
+order_input = None
+
+if uploaded_files and len(uploaded_files) > 1:
+    st.markdown("### 📑 Multi-file sequence settings")
+    st.info("All uploaded files will be merged (in order) into one sequence, then that sequence loops.")
+    st.caption("Enter order as comma-separated indices (e.g. 2,1,3). Leave blank for upload order.")
+    order_input = st.text_input("Order of files (optional)")
+    sweep_between_files = st.checkbox("Sweep between files inside a loop", value=True)
+    per_file_wait = st.number_input("Minutes to wait between files (0 = none)", min_value=0, value=0)
+
+# --- Integrate new limits + guarded logic in UI (wrap existing processing block) ---
+# Find existing: if uploaded_files:
+# Replace that entire try block with the version below
 
 if uploaded_files:
     try:
+        enforce_limits(num_loops, len(uploaded_files), custom_sweep)
+
         if len(uploaded_files) == 1:
-            # Single file mode - read and create looped version
-            with zipfile.ZipFile(uploaded_files[0], "r") as zip_ref:
-                gcode_files = [f for f in zip_ref.namelist() if f.endswith('.gcode')]
-                if not gcode_files:
-                    st.error("No G-code found. Please slice the model in Bambu Studio first.")
-                    st.stop()
-                
-                original_gcode = zip_ref.read(gcode_files[0]).decode('utf-8')
-                looped_gcode = create_looped_gcode(original_gcode, num_loops, sweep_interval)
-                output_3mf = wrap_in_3mf(looped_gcode, uploaded_files[0])
-                mode = "single"
+            gtext, _gpath = extract_first_gcode_from_3mf(uploaded_files[0])
+            single_minutes = parse_estimated_minutes(gtext)
+            looped_gcode = create_looped_gcode(
+                gtext,
+                num_loops,
+                sweep_interval,
+                sweep_pattern_override=custom_sweep if custom_sweep.strip() else None,
+                disable_final_home=disable_final_home
+            )
+            output_3mf = wrap_in_3mf(looped_gcode, uploaded_files[0])
+            mode = "single"
+            file_infos = [{"name": uploaded_files[0].name, "minutes": single_minutes}]
         else:
-            # Multiple files mode - combine and create looped version
-            looped_gcode = build_combined_looped_gcode(uploaded_files, num_loops, sweep_interval)
-            output_3mf = wrap_in_3mf(looped_gcode, uploaded_files[0])  # Use first file as template
+            ordered = uploaded_files
+            if order_input:
+                try:
+                    idxs = [int(x.strip()) - 1 for x in order_input.split(",") if x.strip()]
+                    if sorted(idxs) != list(range(len(uploaded_files))):
+                        raise ValueError("Order must reference each file exactly once.")
+                    ordered = [uploaded_files[i] for i in idxs]
+                except Exception as oe:
+                    st.error(f"Order parse error: {oe}")
+                    st.stop()
+            file_infos = []
+            for f in ordered:
+                try:
+                    gtxt, _ = extract_first_gcode_from_3mf(f)
+                    file_infos.append({"name": f.name, "minutes": parse_estimated_minutes(gtxt)})
+                except Exception:
+                    file_infos.append({"name": f.name, "minutes": None})
+            looped_gcode = build_combined_looped_gcode(
+                ordered,
+                num_loops,
+                sweep_interval,
+                sweep_between_files=sweep_between_files,
+                per_file_wait_min=per_file_wait,
+                sweep_pattern_override=custom_sweep if custom_sweep.strip() else None,
+                disable_final_home=disable_final_home
+            )
+            output_3mf = wrap_in_3mf(looped_gcode, ordered[0])
             mode = "multiple"
-            
-        st.success(f"✅ Created {'combined ' if mode == 'multiple' else ''}farm mode 3MF with {num_loops} loops!")
-        
-        # Add download button
+
+        size_mb = approx_size_mb(looped_gcode)
+        if size_mb > MAX_OUTPUT_GCODE_MB * 0.9:
+            st.warning(f"Large output ({size_mb:.1f} MB). Printer or slicer may refuse very large G-code.")
+
+        st.success(f"✅ Created {'multi-file ' if mode=='multiple' else ''}looped 3MF with {num_loops} loop sequence(s). Size: {size_mb:.2f} MB")
         st.download_button(
             "⬇️ Download Looped 3MF",
             data=output_3mf,
-            file_name=f"looped_{'combined_' if mode == 'multiple' else ''}{uploaded_files[0].name}",
+            file_name=f"looped_{'combined_' if mode=='multiple' else ''}{uploaded_files[0].name}",
             mime="application/octet-stream"
         )
-        
-        # Add information
-        with st.expander("ℹ️ Print Information"):
-            total_time = sweep_interval * (num_loops - 1)
-            hours = total_time // 60
-            minutes = total_time % 60
-            
+
+        with st.expander("ℹ️ Print Plan"):
+            total_wait = (num_loops - 1) * sweep_interval
+            st.write(f"Total inter-loop wait time: {total_wait} minutes")
             if mode == "multiple":
-                st.info(f"""
-                Print Schedule:
-                - Number of files: {len(uploaded_files)}
-                - Number of loop sequences: {num_loops}
-                - Time between loop sequences: {sweep_interval} minutes
-                - Total time between first and last sequence: {hours}h {minutes}m
-                
-                What happens:
-                1. Prints all files in sequence
-                2. Does auto-sweep between files
-                3. Waits {sweep_interval} minutes after sequence
-                4. Repeats sequence {num_loops} times
-                5. Does final sweep and homes
-                """)
-            else:
-                st.info(f"""
-                Print Schedule:
-                - Number of prints: {num_loops}
-                - Time between prints: {sweep_interval} minutes
-                - Total time between first and last print: {hours}h {minutes}m
-                
-                What happens:
-                1. Print completes
-                2. Waits {sweep_interval} minutes
-                3. Does auto-sweep of the bed
-                4. Starts next print
-                5. Repeats until all {num_loops} prints are done
-                """)
-        
-        with st.expander("🔍 Preview G-code"):
-            st.text_area(
-                "Preview", 
-                looped_gcode[:2000] + "\n... [truncated]", 
-                height=300
-            )
+                st.write(f"Files per loop: {len(uploaded_files)}")
+                st.write(f"Sweeps between files: {'Yes' if sweep_between_files else 'No'}")
+                if per_file_wait:
+                    st.write(f"Wait between files: {per_file_wait} min")
+            st.write(f"Final homing: {'Disabled' if disable_final_home else 'Enabled'}")
+            if custom_sweep.strip():
+                st.write("Custom sweep pattern: Yes (override applied)")
+            # Runtime estimates
+            if any(fi.get('minutes') for fi in file_infos):
+                sweep_pattern_used = custom_sweep if custom_sweep.strip() else get_sweep_pattern()
+                per_loop_minutes, sweep_guess = estimate_combined_runtime_per_loop(
+                    file_infos,
+                    sweep_between_files if mode == 'multiple' else False,
+                    per_file_wait if mode == 'multiple' else 0,
+                    sweep_pattern_used,
+                    sweep_interval
+                )
+                total_minutes = per_loop_minutes * num_loops + (num_loops - 1) * sweep_interval
+                def fmt(m):
+                    return f"{int(m//60)}h {(m%60):.0f}m" if m >= 60 else f"{m:.1f}m"
+                st.markdown("**Estimated Runtime (very approximate)**")
+                st.write("Per loop (print + in-loop waits/ sweeps):", fmt(per_loop_minutes))
+                st.write("Between-loop waits:", fmt((num_loops -1)* sweep_interval))
+                st.write("Total (all loops):", fmt(total_minutes))
+                with st.expander("Per-file estimates"):
+                    for fi in file_infos:
+                        st.write(f"{fi['name']}: {fi['minutes']:.1f}m" if fi.get('minutes') else f"{fi['name']}: (unknown)")
+                    st.caption(f"Sweep time guess per sweep: ~{sweep_guess:.2f}m (heuristic)")
+        with st.expander("🔍 Preview (first 2000 chars)"):
+            st.text_area("Preview", looped_gcode[:2000] + "\n... [truncated]", height=300)
+    except (GcodeParseError, GcodeSizeError, ValueError) as ge:
+        st.error(f"❌ {ge}")
     except Exception as e:
-        st.error(f"⚠️ Error: {str(e)}")
+        st.exception(e)
