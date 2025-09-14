@@ -26,6 +26,68 @@ Loop one or more sliced `.3mf` prints (Bambu Studio exports) into a single autom
 7. New `.3mf` is built by copying original archive and swapping the G-code.
 8. Download the new looped `.3mf` and send to printer.
 
+## Quick Test Run (Recommended Before Long Jobs)
+Use this short procedure to validate your setup before committing to a long multi-loop production run.
+
+### A. Prepare a Tiny Test Model
+- Open Bambu Studio.
+- Slice a very small object (e.g. a 20mm calibration cube) with low layer height or reduce its height (e.g. 5–8 layers).
+- Export the sliced `.3mf` (ensure it contains G-code).
+
+### B. Generate a Minimal Loop
+1. Launch the app: `streamlit run streamlit_app.py`
+2. Upload the small `.3mf`.
+3. Set:
+   - Loops: 2
+   - Minutes between loop sequences: 0 (for fastest validation)
+   - Leave other options default (no custom sweep at first).
+4. Create & download the looped `.3mf`.
+
+### C. Sanity Check the G-code (Optional but Helpful)
+- Unzip the new file: `unzip looped_test.3mf -d test_out`
+- Open the `.gcode` inside and verify:
+  - A single header at top (startup / temps).
+  - Two occurrences of `; === LOOP 1 START ===` / `LOOP 2 START`.
+  - Only one final sweep/footer section.
+- Search a distinctive mid-print line (e.g. a specific `G1 X... E...`) and confirm it appears exactly twice.
+
+### D. Printer Dry Run (Optional)
+If your firmware supports it, you can:
+- Remove filament or disable extrusion (or watch closely).
+- Start print; confirm:
+  - Bed & nozzle reach expected temps.
+  - First loop finishes; motion immediately restarts the object (or performs configured sweep first).
+  - Temps stay stable (no unintended cooldown between loops).
+
+### E. Add Customizations Incrementally
+Repeat the test (still with 2 loops) while adding:
+1. Custom sweep pattern.
+2. Non-zero wait between loops (e.g. 1 minute).
+3. Multi-file combine (use two small test models).
+4. Skip final homing toggle (verify last G28 disappears).
+
+After each change, re-check output G-code markers.
+
+### F. Scale Up
+Once satisfied:
+- Increase loops gradually (e.g. 2 → 5 → 10).
+- Monitor first full production loop before leaving unattended.
+
+### Red Flags During Test
+| Symptom | Action |
+| ------- | ------ |
+| Printer cools between loops | Footer may include shutdown; inspect & adjust |
+| Extrusion failure at loop 2 start | May need a priming move added to sweep pattern |
+| Unexpected homing mid-loop | Check bodies for stray G28 commands |
+| Different temps mid-run | Ensure only the header defines temps, bodies don’t override |
+
+### Optional Hash Check (Advanced)
+You can script a hash of the original print body and confirm it repeats:
+```bash
+grep -n "=== LOOP" looped.gcode
+```
+Or write a small Python snippet to extract and hash the body region.
+
 ## UI Options (Summary)
 | Option | Purpose |
 | ------ | ------- |
