@@ -1,60 +1,105 @@
-## Bambu Lab Print Looper
+# Bambu Lab Print Looper
 
-Generate a modified `.3mf` that re-runs one or more sliced prints in a controlled loop with optional sweeps, waits, and custom cleanup patterns. Useful for farm-style batch production without re-slicing or manually restarting jobs.
+Loop one or more sliced `.3mf` prints (Bambu Studio exports) into a single automated production job with optional waits, sweeps (cleanup moves), and runtime estimates.
 
-### Core Capabilities
-* Single-file looping with configurable loop count & wait minutes between loops.
-* Multi-file combine mode: merge several `.3mf` prints into a single composite sequence, then loop that composite set.
-* Optional sweep (purge / wipe) pattern between: files, loops, final end.
-* Custom sweep pattern override (author your own G-code motions/purges).
-* Toggle to skip final homing (G28) if you want printer to remain where last sweep ends.
-* Per-file runtime parsing (best-effort) and aggregated loop runtime estimates.
-* Order control for multiple files (comma‑separated reordering in UI).
+## Key Features
+- Single-file looping
+- Multi-file combining (A → B → C …) then loop that set
+- Custom file order (e.g. 3,1,2)
+- Optional sweep between files and/or between loop sequences
+- Optional wait (minutes) between files
+- Configurable wait between loop sequences
+- Custom sweep G-code override
+- Optional skip of final homing (G28)
+- Heuristic runtime estimation (per loop + total)
+- Output packaged back into a valid `.3mf` (original assets preserved except G-code replaced)
+- Safety limits on loops, file count, custom sweep size, and output size
+- Preview of first 2000 chars of generated G-code
 
-### Runtime Estimation
-The app attempts to read estimated time comments (e.g. `;ESTIMATED_TIME:`, `;TIME:` or `PRINT_ESTIMATE_TIME:`) inside each embedded G-code. If found, it:
-1. Sums file estimates.
-2. Adds inter-file waits and approximate sweep time (heuristic based on G1 moves in sweep code).
-3. Multiplies by loop count and adds between-loop waits.
+## How It Works
+1. Upload one or more `.3mf` files (they must already contain sliced G-code).
+2. App extracts the embedded `.gcode` (3MF is a ZIP container).
+3. G-code is split into: header, print body (moves), footer.
+4. For single file: print body is repeated N times with optional waits + sweeps.
+5. For multiple files: each print body is concatenated (optional sweep/wait between) forming one base sequence; that sequence is looped.
+6. Final sweep (and homing unless disabled) is appended.
+7. New `.3mf` is built by copying original archive and swapping the G-code.
+8. Download the new looped `.3mf` and send to printer.
 
-Estimates are approximate; always consult your printer's live prediction.
+## UI Options (Summary)
+| Option | Purpose |
+| ------ | ------- |
+| Number of loop sequences | How many times to repeat (single or combined set) |
+| Minutes between loop sequences | G4 dwell + sweep between each full loop |
+| Order of files | Comma-separated 1-based indices |
+| Sweep between files | Insert sweep pattern between combined files |
+| Minutes to wait between files | Adds G4 dwell before next file in same loop |
+| Custom sweep G-code | Override default cleanup moves everywhere |
+| Skip final homing | Suppress last `G28` |
+| Preview | First 2000 chars for safety review |
 
-### Usage
-1. Slice models in Bambu Studio, export/save each `.3mf` (they must contain G-code — cloud-only jobs won't work).
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Launch the app:
-   ```bash
-   streamlit run streamlit_app.py
-   ```
-4. Upload one or more `.3mf` files.
-5. (Optional) Reorder multi-file sequence via indices (e.g. `2,1,3`).
-6. Set loops, waits, sweeps, and custom pattern if desired.
-7. Download the generated looped `.3mf` and print.
+## Runtime Estimation
+- Parses common slicer time comments (seconds → minutes).
+- Unknown files show “(unknown)”.
+- Sweep time guessed from count of movement lines in sweep pattern.
+- Total time = (print + in-loop waits) * loops + between-loop waits.
+- Estimates are approximate; verify on printer.
 
-### Custom Sweep Pattern Tips
-Provide raw G-code. Common inclusions:
+## Installation
+```bash
+git clone <repo-url>
+cd bambulabloop
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run streamlit_app.py
 ```
-M400           ; wait for moves to finish
-G91 / G90      ; relative / absolute switches
-G1 E-.. / E..  ; purge/retract
-G4 S#          ; dwell seconds
-```
-Your pattern is injected verbatim; validate preview.
 
-### Safety & Disclaimer
-Batch / unattended printing increases risk. Always:
-* Monitor first loop fully.
-* Ensure nozzle/bed cooldown logic (if needed) is preserved.
-* Validate that skipping homing will not cause collisions if enabled.
+## Typical Scenarios
+- Repeat one part 25 times overnight (set loops=25, interval=0).
+- Produce a kit of 3 models repeatedly (upload 3 files, set loops>1).
+- Insert cooling pause between different materials (per-file wait > 0).
+- Use custom purge/wipe sequence (paste G-code in sweep override).
+- Disable final homing for alignment-sensitive camera rig.
 
-Use at your own risk. Review generated G-code before printing.
+## Custom Sweep Notes
+Provide only valid G-code fragment (no starting header). App appends it where needed. Size limit enforced (default 64 KB).
 
-### Future Ideas
-* Material/AMS slot change scripting per loop.
-* Filament usage aggregation.
-* More robust time extraction (parsing Bambu metadata XML if present).
+## Safety Limits (Defaults)
+- Max loops: 500
+- Max files: 30
+- Max custom sweep: 64 KB
+- Max output G-code: ~45 MB
+Exceeding a limit raises a UI error.
 
-PRs welcome!
+## G-code Integrity
+- Only first `.gcode` file inside each 3MF is used.
+- If print body cannot be detected (markers missing), an error is shown with a diagnostic snippet.
+- Extremely short bodies rejected.
+
+## Troubleshooting
+| Issue | Cause / Fix |
+| ----- | ----------- |
+| “No .gcode asset found” | Slice/export in Bambu Studio first |
+| “Could not parse G-code structure” | Non-standard file; verify markers present |
+| Output size limit error | Reduce loops or file count |
+| Time estimate missing | Slicer did not embed recognizable time comment |
+| Printer rejects job | G-code too large or unsupported commands in custom sweep |
+
+## Good Practices
+- Test with 1 loop before long runs.
+- Avoid very large custom sweep blocks.
+- Ensure purge / sweep motions stay within printable area.
+- Monitor first repetition to confirm safe restart conditions (temp, bed adhesion).
+
+## Future Ideas (Not Implemented)
+- Filament usage aggregation
+- Per-loop parameter drift (temp, speed)
+- Preset sweep patterns
+- Multi-G-code asset selection inside 3MF
+
+## Disclaimer
+Use at your own risk. Verify generated motions are safe for your printer setup.
+
+## License
+Add a license file if distributing.
