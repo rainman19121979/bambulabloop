@@ -116,67 +116,85 @@ G28 ; home all axes
 
 # ========== 3MF Handling ==========
 def find_gcode_sections(gcode_text):
-    """Find the header, print moves, and footer sections of G-code."""
-    # Try to find print content using different possible markers
-    start_markers = [
-        ";LAYER:0",
-        "; layer 0",
-        ";TYPE:WALL-OUTER",
-        "G1 Z0.3",  # First layer height
-        "; retract extruder"  # Bamboo-specific marker
-    ]
-    
-    end_markers = [
-        ";END gcode",
-        ";End of Gcode",
-        ";end of print",
-        "M104 S0",  # Turn off extruder
-        "M140 S0"   # Turn off bed
-    ]
-    
-    start = -1
-    end = -1
-    
-    # Find start of actual print moves
-    for marker in start_markers:
-        pos = gcode_text.find(marker)
-        if pos != -1:
-            start = pos
+    """
+    Header / print_moves / footer robust:
+    - Nutzt EXECUTABLE_BLOCK_START/END, wenn vorhanden (enthält Heizen/Start).
+    - Fallback: erster echter Move nach ;LAYER:0 bis zu Abschaltkommandos.
+    """
+    import re
+    lines = gcode_text.splitlines()
+
+    # ---- 1) Bevorzugt: EXECUTABLE_BLOCK_* ----
+    exec_start = None
+    exec_end = None
+    for i, l in enumerate(lines):
+        s = l.strip().upper()
+        if s.endswith("EXECUTABLE_BLOCK_START") or s.startswith("; EXECUTABLE_BLOCK_START"):
+            exec_start = i + 1
             break
-    
-    # Find end of print moves
-    for marker in end_markers:
-        pos = gcode_text.rfind(marker)
-        if pos != -1:
-            end = pos
+    if exec_start is not None:
+        for j in range(len(lines)-1, -1, -1):
+            s = lines[j].strip().upper()
+            if s.endswith("EXECUTABLE_BLOCK_END") or s.startswith("; EXECUTABLE_BLOCK_END"):
+                exec_end = j - 1
+                break
+        if exec_end is not None and exec_end > exec_start:
+            header = "\n".join(lines[:exec_start])
+            print_moves = "\n".join(lines[exec_start:exec_end+1])
+            footer = "\n".join(lines[exec_end+1:])
+            if len(print_moves) < 100:
+                raise ValueError("Invalid print content length (exec block too short)")
+            return header, print_moves, footer
+
+    # ---- 2) Fallback: Kommentare/Configs ignorieren ----
+    def is_comment(s): return s.lstrip().startswith(';')
+    def is_real_move(s):
+        s = s.lstrip()
+        if is_comment(s): return False
+        if any(c in s for c in '{}[]') or '=' in s:  # keine Macro/Config-Zeilen
+            return False
+        return bool(re.match(r'^(G0|G1|G2|G3)\b', s))
+
+    start_anchor = None
+    for i, l in enumerate(lines):
+        if re.search(r'^\s*;LAYER:\s*0\b', l, re.IGNORECASE) \
+           or re.search(r'^\s*;MESH:', l, re.IGNORECASE) \
+           or re.search(r'^\s*;TYPE:\s*WALL-OUTER', l, re.IGNORECASE):
+            start_anchor = i
             break
-    
-    if start == -1 or end == -1:
-        # If we can't find markers, try to find the first G1 move and last M104/M140
-        lines = gcode_text.split('\n')
-        for i, line in enumerate(lines):
-            if start == -1 and ('G1' in line or 'G0' in line) and 'Z' in line:
-                start = gcode_text.find(line)
-            if ('M104 S0' in line or 'M140 S0' in line or 
-                'G28' in line):  # Home command often indicates end
-                end = gcode_text.find(line)
-    
-    if start == -1 or end == -1:
-        st.error("Could not find print boundaries in G-code. Please make sure the file is properly sliced in Bambu Studio.")
-        st.error("Debug Info:")
-        st.code(gcode_text[:1000])  # Show first 1000 characters for debugging
-        raise ValueError("Could not parse G-code structure")
-        
-    header = gcode_text[:start]
-    print_moves = gcode_text[start:end]
-    footer = gcode_text[end:]
-    
-    # Validate that we have reasonable content
-    if len(print_moves) < 100:  # Too short to be valid print moves
-        st.error("Print content seems too short. Please check if the file is properly sliced.")
+
+    search_from = (start_anchor + 1) if start_anchor is not None else 0
+    start_idx = None
+    for i in range(search_from, len(lines)):
+        if is_real_move(lines[i]):
+            start_idx = i
+            break
+
+    end_idx = None
+    end_markers = [r'^\s*M140\s+S0\b', r'^\s*M104\s+S0\b', r'^\s*G28\b',
+                   r'^\s*;END gcode\b', r'^\s*;End of Gcode\b', r'^\s*;end of print\b']
+    for i in range(len(lines)-1, -1, -1):
+        l = lines[i]
+        if is_comment(l): continue
+        if any(re.search(p, l, re.IGNORECASE) for p in end_markers):
+            end_idx = i
+            break
+    if end_idx is None:
+        for i in range(len(lines)-1, -1, -1):
+            if not is_comment(lines[i]) and lines[i].strip():
+                end_idx = i
+                break
+
+    if start_idx is None or end_idx is None or end_idx <= start_idx:
+        raise ValueError("Could not parse G-code structure (fallback)")
+
+    header = "\n".join(lines[:start_idx])
+    print_moves = "\n".join(lines[start_idx:end_idx+1])
+    footer = "\n".join(lines[end_idx+1:])
+    if len(print_moves) < 100:
         raise ValueError("Invalid print content length")
-        
     return header, print_moves, footer
+
 
 def safe_decode(data: bytes) -> str:
     """Try multiple decodings before failing."""
