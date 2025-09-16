@@ -16,9 +16,9 @@ class GcodeSizeError(Exception):
     pass
 
 # Reasonable defaults
-MAX_OUTPUT_GCODE_MB = 40          # Max size of generated G-code (MB)
-MAX_LOOPS = 50                    # Safety limit
-MAX_FILES = 20                    # Safety limit for multi-file combine
+MAX_OUTPUT_GCODE_MB = 45          # Max size of generated G-code (MB)
+MAX_LOOPS = 500                    # Safety limit
+MAX_FILES = 30                    # Safety limit for multi-file combine
 MAX_CUSTOM_SWEEP_KB = 64          # Max size of custom sweep (KB)
 
 def wrap_in_3mf(new_gcode_text: str, base_3mf_file) -> bytes:
