@@ -6,6 +6,48 @@ import re
 import math
 from typing import Optional, Tuple
 
+# ===== Exceptions, Limits & 3MF-Wrapper (required) =====
+class GcodeParseError(Exception):
+    """Raised when a 3MF does not contain readable G-code or structure is invalid."""
+    pass
+
+class GcodeSizeError(Exception):
+    """Raised when the generated G-code exceeds a safe size limit."""
+    pass
+
+# Reasonable defaults
+MAX_OUTPUT_GCODE_MB = 40          # Max size of generated G-code (MB)
+MAX_LOOPS = 50                    # Safety limit
+MAX_FILES = 20                    # Safety limit for multi-file combine
+MAX_CUSTOM_SWEEP_KB = 64          # Max size of custom sweep (KB)
+
+def wrap_in_3mf(new_gcode_text: str, base_3mf_file) -> bytes:
+    """
+    Take the uploaded .3mf, replace the FIRST .gcode inside with new_gcode_text,
+    and return a fresh .3mf as bytes.
+    """
+    import zipfile, io
+
+    with zipfile.ZipFile(base_3mf_file, "r") as zin:
+        names = zin.namelist()
+        gcode_names = [n for n in names if n.endswith(".gcode")]
+        if not gcode_names:
+            fname = getattr(base_3mf_file, "name", "uploaded.3mf")
+            raise GcodeParseError(f"No .gcode asset found in {fname}")
+
+        replace_target = gcode_names[0]
+
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for n in names:
+                if n == replace_target:
+                    zout.writestr(n, new_gcode_text)
+                else:
+                    zout.writestr(n, zin.read(n))
+
+        return out_buf.getvalue()
+
+
 # ========== G-code Processing Functions
 def get_sweep_pattern():
     """Returns the standard sweep pattern G-code."""
